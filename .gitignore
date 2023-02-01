@@ -1,6 +1,3 @@
-DUMMY1
-DUMMY2
-DUMMY3
 logs
 __pycache__
 .ipynb_checkpoints
@@ -8,4 +5,7 @@ __pycache__
 
 build
 *.c
-monotonic_align/monotonic_align
+monotonic_align/target
+
+lightning_logs
+datasets
