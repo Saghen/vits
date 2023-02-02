@@ -6,7 +6,7 @@ from torch.cuda.amp import autocast
 from commons import clip_grad_value_
 import commons
 import utils
-from data_utils import TextAudioLoader, TextAudioCollate, DistributedBucketSampler
+from data_utils import TextAudioLoader, TextAudioCollate, BucketSampler
 from models.synthesizer import SynthesizerTrn
 from models.discriminator import MultiPeriodDiscriminator
 from losses import generator_loss, discriminator_loss, feature_loss, kl_loss
@@ -29,14 +29,13 @@ class VitsDataModule(pl.LightningDataModule):
         self.val = TextAudioLoader(self.hps.dataset, train=False)
 
     def train_dataloader(self):
-        train_sampler = DistributedBucketSampler(
+        train_sampler = BucketSampler(
             self.train,
-            hps.train.batch_size,
-            [32, 300, 400, 500, 600, 700, 800, 900, 1000],
+            hps.train.batch_size
         )
         return DataLoader(
             self.train,
-            num_workers=4,
+            num_workers=8,
             pin_memory=True,
             collate_fn=TextAudioCollate(),
             persistent_workers=True,
@@ -46,10 +45,9 @@ class VitsDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.val,
-            num_workers=4,
+            num_workers=8,
             batch_size=hps.train.batch_size,
             pin_memory=True,
-            drop_last=False,
             collate_fn=TextAudioCollate(),
             persistent_workers=True,
         )
@@ -89,6 +87,7 @@ class Vits(pl.LightningModule):
             z_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q),
         ) = self(x, x_lengths, spec, spec_lengths)
+
         mel = self.spec_to_mel_torch(spec)
         y_mel = commons.slice_segments(
             mel,
@@ -109,18 +108,10 @@ class Vits(pl.LightningModule):
 
         optim_discriminator.zero_grad(set_to_none=True)
         self.manual_backward(loss_disc_all)
-        discriminator_grad_clip = clip_grad_value_(
-            self.discriminator.parameters(), None
-        )
+        self.clip_gradients(optim_discriminator)
         optim_discriminator.step()
 
-        self.log(
-            "train/discriminator/grad_clip",
-            discriminator_grad_clip,
-            on_step=False,
-            on_epoch=True,
-        )
-        self.log("train/discriminator/all", loss_disc, on_step=False, on_epoch=True)
+        self.log("train/discriminator/all", loss_disc, on_step=False, on_epoch=True, sync_dist=True)
 
         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(y, y_hat)
         with autocast(enabled=False):
@@ -131,23 +122,18 @@ class Vits(pl.LightningModule):
             loss_fm = feature_loss(fmap_r, fmap_g)
             loss_gen, losses_gen = generator_loss(y_d_hat_g)
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+
         optim_generator.zero_grad(set_to_none=True)
         self.manual_backward(loss_gen_all)
-        generator_grad_clip = clip_grad_value_(self.generator.parameters(), None)
+        self.clip_gradients(optim_generator)
         optim_generator.step()
 
-        self.log("train/generator/duration", loss_dur, on_step=False, on_epoch=True)
-        self.log("train/generator/mel", loss_mel, on_step=False, on_epoch=True)
-        self.log("train/generator/kl", loss_kl, on_step=False, on_epoch=True)
-        self.log("train/generator/feature", loss_fm, on_step=False, on_epoch=True)
-        self.log("train/generator/generator", loss_gen, on_step=False, on_epoch=True)
-        self.log("train/generator/all", loss_gen_all, on_step=False, on_epoch=True)
-        self.log(
-            "train/generator/grad_clip",
-            generator_grad_clip,
-            on_step=False,
-            on_epoch=True,
-        )
+        self.log("train/generator/duration", loss_dur, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/generator/mel", loss_mel, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/generator/kl", loss_kl, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/generator/feature", loss_fm, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/generator/generator", loss_gen, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/generator/all", loss_gen_all, on_step=False, on_epoch=True, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
         (x, x_lengths, spec, spec_lengths, y, y_lengths) = batch
@@ -272,6 +258,5 @@ if __name__ == "__main__":
     model = Vits(hps)
     data = VitsDataModule(hps)
 
-    trainer = pl.Trainer(accelerator="gpu", devices=1, precision=16, max_steps=500000)
-    # trainer.tune(model, data)
+    trainer = pl.Trainer(accelerator="gpu", devices=-1, precision=16, max_steps=1000000, strategy='ddp', replace_sampler_ddp=False, check_val_every_n_epoch=5)
     trainer.fit(model, data)

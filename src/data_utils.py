@@ -353,7 +353,7 @@ class TextAudioSpeakerCollate:
         )
 
 
-class DistributedBucketSampler(torch.utils.data.Sampler):
+class DistributedBucketSampler(torch.utils.data.DistributedSampler):
     """
     Maintain similar input lengths in a batch.
     Length groups are specified by boundaries.
@@ -367,9 +367,10 @@ class DistributedBucketSampler(torch.utils.data.Sampler):
         self,
         dataset,
         batch_size,
-        boundaries
+        boundaries,
+        **kwargs
     ):
-        super().__init__(dataset)
+        super().__init__(dataset, **kwargs)
         self.lengths = dataset.lengths
         self.batch_size = batch_size
         self.boundaries = boundaries
